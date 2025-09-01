@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Westie Quest — 8‑bit Free World Exploring Game</title>
+  <style>
+    html, body {
+      margin: 0; height: 100%; background: #0b0b0b; color: #eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    .wrap { display: grid; place-items: center; gap: 10px; padding: 14px; }
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; border-radius: 10px; box-shadow: 0 10px 35px rgba(0,0,0,.55), inset 0 0 0 2px rgba(255,255,255,.02); background:#1a1a1a; }
+    .panel { max-width: 960px; width: 100%; display: grid; gap: 8px; }
+    .bar { display:flex; justify-content: space-between; gap: 8px; font-size: 14px; flex-wrap: wrap; }
+    .chip { background: #121212; padding: 6px 9px; border-radius: 999px; border: 1px solid #2b2b2b; }
+    .btns { display:flex; gap: 6px; flex-wrap: wrap; }
+    .kbd { background:#111; border:1px solid #2a2a2a; border-bottom-color:#222; padding: 2px 6px; border-radius:6px; font-weight:600; }
+    .hint { opacity:.9 }
+    .progressTrack { height: 8px; border-radius: 999px; background: #222; overflow: hidden; }
+    .progressFill { height: 100%; background: #39d353; width: 0%; }
+    .link { color: #9ad; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="panel">
+      <div class="bar">
+        <div id="levelName" class="chip">Level: Garden</div>
+        <div id="objective" class="chip">Objective: Bark at 12 birds (0/12)</div>
+        <div class="chip hint">Click things to learn what they are</div>
+      </div>
+      <div class="bar">
+        <div class="btns hint">
+          <span class="kbd">WASD/Arrows</span> Move
+          <span class="kbd">B / Space</span> Bark
+          <span class="kbd">S</span> Scratch
+          <span class="kbd">E</span> Bite / Chew
+          <span class="kbd">L</span> Lay down
+          <span class="kbd">Enter</span> Door / Interact
+        </div>
+        <div style="flex:1; min-width:200px;">
+          <div class="progressTrack" title="Room objective progress">
+            <div id="progress" class="progressFill"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <canvas id="game" width="960" height="540"></canvas>
+    <div class="panel hint">Made for you — an 8‑bit style adventure starring a white Westie 🐶</div>
+  </div>
+
+  <script>
+  (function(){
+    // --- Basic 8-bit canvas setup ---
+    const CANVAS = document.getElementById('game');
+    const CTX = CANVAS.getContext('2d');
+
+    const SCALE = 4;           // 1 world unit = 4 canvas pixels
+    const W = 240;             // world width (units)
+    const H = 135;             // world height (units)
+
+    // UI elements
+    const UI = {
+      levelName: document.getElementById('levelName'),
+      objective: document.getElementById('objective'),
+      progress: document.getElementById('progress'),
+    };
+
+    // Utility
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const rnd = (a, b) => a + Math.random() * (b - a);
+
+    // Input
+    const keys = new Set();
+    let mouse = { x:0, y:0, just:false };
+    window.addEventListener('keydown', e=>{ keys.add(e.key); if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault(); });
+    window.addEventListener('keyup', e=> keys.delete(e.key));
+    CANVAS.addEventListener('mousemove', e=>{
+      const r = CANVAS.getBoundingClientRect();
+      mouse.x = Math.floor((e.clientX - r.left) / SCALE);
+      mouse.y = Math.floor((e.clientY - r.top) / SCALE);
+    });
+    CANVAS.addEventListener('mousedown', e=>{ mouse.just = true; });
+
+    // World state
+    let level = 'garden';
+    let fade = 0;        // 0..1 black fade
+    let transitioning = false;
+    let hintText = '';
+    let hintTimer = 0;
+
+    // Player (white Westie)
+    const player = {
+      x: W*0.5, y: H*0.8, w: 8, h: 8, vx:0, vy:0, speed: 0.8, facing: 1,
+      barkCD: 0, scratchCD: 0, chew: false, lay: false,
+    };
+
+    // Door selection from garden
+    // 1: Adults, 2: Girl, 3: Boy, 4: Locked
+    let gardenDoors = [
+      {id:1, x: 30, y: 8, w: 20, h: 30, open:false, label:'Door 1 — Adults\' Room'},
+      {id:2, x: 60, y: 8, w: 20, h: 30, open:false, label:'Door 2 — Girl\'s Room'},
+      {id:3, x: 90, y: 8, w: 20, h: 30, open:false, label:'Door 3 — Boy\'s Room'},
+      {id:4, x: 120, y:8, w: 20, h: 30, open:false, label:'Door 4 — (won\'t open)'},
+    ];
+
+    // Clickable registry for tooltips
+    let clickables = [];
+    function addClickable(box, label){ clickables.push({ ...box, label }); }
+
+    // Birds & lizards in the garden
+    const birds = []; // {id,x,y,vx,vy, barked}
+    const lizards = [];
+
+    // Objectives tracking
+    const progress = {
+      garden_birds_barked: 0,
+      adult_naps: 0,           // lay down on 8 clothes/suitcases
+      girl_bite_ms: 0,         // 25000 to finish
+      boy_pats: 0,             // 11 pats
+      doneGarden: false,
+      doneAdults: false,
+      doneGirl: false,
+      doneBoy: false,
+      ending: false,
+    };
+
+    // Room objects
+    let adultsObjs = []; // suitcases + clothes
+    let girlObjs = { plush:{x: W*0.5-10, y: H*0.7, w: 20, h: 12, name:'Plushie Mountain'} };
+
+    // Initialize garden creatures
+    (function initGarden(){
+      for(let i=0;i<12;i++){
+        birds.push({ id:i, x: rnd(20,W-20), y: rnd(25,H-30), vx: rnd(-0.2,0.2), vy: rnd(-0.2,0.2), barked:false });
+      }
+      for(let i=0;i<6;i++){
+        lizards.push({ x: rnd(15,W-15), y: rnd(H*0.6,H-10), vx: rnd(-0.2,0.2), vy: rnd(-0.2,0.2) });
+      }
+    })();
+
+    // Initialize adult room items (4 suitcases + 4 clothes)
+    (function initAdults(){
+      const items = [];
+      const names = ['Suitcase','Clothes Pile'];
+      for(let i=0;i<8;i++){
+        const isCase = i%2===0;
+        const w = isCase ? 10 : 8;
+        const h = isCase ? 6 : 5;
+        items.push({ x: 25 + (i%4)*30, y: 85 + Math.floor(i/4)*12, w, h, name: isCase? (names[0]+' '+(1+Math.floor(i/2))) : (names[1]+' '+(1+Math.floor(i/2))), laid:false });
+      }
+      adultsObjs = items;
+    })();
+
+    // Click tooltip
+    function showHint(text, ms=1800){ hintText = text; hintTimer = ms; }
+
+    // HUD update per level
+    function setHUD(){
+      if(level==='garden'){
+        UI.levelName.textContent = 'Level: Garden';
+        UI.objective.textContent = `Objective: Bark at 12 birds (${progress.garden_birds_barked}/12)`;
+        UI.progress.style.width = (progress.garden_birds_barked/12*100)+'%';
+      } else if(level==='adults'){
+        UI.levelName.textContent = "Level: Adults' Room";
+        UI.objective.textContent = `Objective: Lay on 8 suitcases/clothes (${progress.adult_naps}/8)`;
+        UI.progress.style.width = (progress.adult_naps/8*100)+'%';
+      } else if(level==='girl'){
+        UI.levelName.textContent = "Level: Girl's Room";
+        const sec = Math.floor(progress.girl_bite_ms/1000);
+        UI.objective.textContent = `Objective: Bite plushies for 25s (${sec}/25s)`;
+        UI.progress.style.width = (progress.girl_bite_ms/25000*100)+'%';
+      } else if(level==='boy'){
+        UI.levelName.textContent = "Level: Boy's Room";
+        UI.objective.textContent = `Objective: Get 11 pats (${progress.boy_pats}/11)`;
+        UI.progress.style.width = (progress.boy_pats/11*100)+'%';
+      } else if(level==='living'){
+        UI.levelName.textContent = 'Level: Living Room';
+        UI.objective.textContent = 'Objective: Go curl up on the couch next to everyone';
+        UI.progress.style.width = '0%';
+      }
+    }
+
+    // Drawing helpers (8-bit rectangles & simple sprites)
+    function rect(x,y,w,h,color){ CTX.fillStyle=color; CTX.fillRect(Math.floor(x*SCALE), Math.floor(y*SCALE), Math.floor(w*SCALE), Math.floor(h*SCALE)); }
+    function stroke(x,y,w,h,color){ CTX.strokeStyle=color; CTX.lineWidth = 1; CTX.strokeRect(Math.floor(x*SCALE)+0.5, Math.floor(y*SCALE)+0.5, Math.floor(w*SCALE), Math.floor(h*SCALE)); }
+
+    function drawWestie(px,py,dir=1,lying=false){
+      // Simple white westie: body + head + ears + tail
+      const c1 = '#ffffff'; const c2 = '#e8e8e8'; const nose = '#222';
+      if(lying){
+        rect(px, py+4, 10, 4, c1); rect(px+8, py+6, 2, 2, c2); // body
+        rect(px+2, py+2, 5, 4, c1); // head
+        rect(px+1, py+1, 2, 2, c1); rect(px+4, py+1, 2, 2, c1); // ears
+        rect(px+6, py+3, 1, 1, nose);
+      } else {
+        // standing
+        rect(px, py, 6, 4, c1); // body
+        rect(px+5*dir<0?px-2:px+4, py-2, 3, 3, c1); // head (simple flip by dir)
+        // ears
+        rect(px+(dir>0?4:-2), py-3, 1.5, 1.5, c1);
+        rect(px+(dir>0?6:-4), py-3, 1.5, 1.5, c1);
+        // tail
+        rect(px+(dir>0? -1:6), py+1, 1, 2, c1);
+        // nose/eye
+        rect(px+(dir>0?7:-3), py-1, 1, 1, nose);
+      }
+    }
+
+    function drawSpeech(x,y,text){
+      // tiny speech bubble
+      const pad=2; const tw = text.length*3.2 + pad*2; const th = 8;
+      rect(x-1, y-1, tw+2, th+2, '#00000055');
+      rect(x, y, tw, th, '#111'); stroke(x, y, tw, th, '#333');
+      CTX.fillStyle = '#ddd'; CTX.font = `${3*SCALE}px monospace`; CTX.textBaseline='top';
+      CTX.fillText(text, Math.floor((x+pad)*SCALE), Math.floor((y+pad-1)*SCALE));
+    }
+
+    function pointInBox(px,py, b){ return px>=b.x && py>=b.y && px<=b.x+b.w && py<=b.y+b.h; }
+    function boxesOverlap(a,b){ return a.x<a.x+a.w && b.x<b.x+b.w && a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y; }
+
+    // World bounds collision for player
+    function keepInBounds(){ player.x = clamp(player.x, 4, W-10); player.y = clamp(player.y, 12, H-10); }
+
+    // --- LEVEL RENDERERS ---
+    function drawGarden(){
+      clickables = [];
+      // grass
+      rect(0,0,W,H,'#1d5b2a');
+      // pool
+      rect(W*0.65, H*0.35, 50, 24, '#1b78a5'); stroke(W*0.65, H*0.35, 50, 24, '#0f4d69'); addClickable({x:W*0.65,y:H*0.35,w:50,h:24},'Blue pool — splashy!');
+      // plants
+      for(let i=0;i<5;i++){ rect(8+i*12, 20+rnd(-3,3), 8, 6, '#2c7d3a'); addClickable({x:8+i*12,y:20,w:8,h:6},'Shrub'); }
+      // lizards
+      lizards.forEach(l=>{ l.x+=l.vx; l.y+=l.vy; if(Math.random()<0.02){ l.vx=rnd(-0.3,0.3); l.vy=rnd(-0.3,0.3);} l.x=clamp(l.x,4,W-6); l.y=clamp(l.y,H*0.5,H-6); rect(l.x,l.y,3,2,'#8bb36a'); });
+      // birds
+      birds.forEach(b=>{
+        b.x+=b.vx; b.y+=b.vy; if(Math.random()<0.02){ b.vx=rnd(-0.3,0.3); b.vy=rnd(-0.3,0.3);} b.x=clamp(b.x,6,W-6); b.y=clamp(b.y,18,H*0.55);
+        rect(b.x-1, b.y-1, 2, 2, b.barked?'#ffee77':'#dddddd');
+      });
+      // house wall (top)
+      rect(0,0,W,14,'#c9c9c9'); stroke(0,0,W,14,'#aaaaaa'); addClickable({x:0,y:0,w:W,h:14},'House wall');
+      // 4 window-like black doors
+      gardenDoors.forEach((d,i)=>{
+        const col = d.open? '#2a2a2a' : '#000';
+        rect(d.x, d.y, d.w, d.h, col); stroke(d.x, d.y, d.w, d.h, '#555');
+        const tag = d.open && d.id<=3 ? `Press Enter to choose: ${d.label}` : (d.id===4? 'This one doesn\'t open…' : 'Locked (bark birds first!)');
+        addClickable({x:d.x,y:d.y,w:d.w,h:d.h}, d.label + (d.id===4?' (permanently locked)':''));
+        if(pointInBox(player.x, player.y, {x:d.x, y:d.y+d.h, w:d.w, h:4})) drawSpeech(d.x, d.y+d.h+2, tag);
+      });
+
+      // objective text ground sign
+      rect(6, H-12, 54, 8, '#0f0f0f'); stroke(6, H-12, 54, 8, '#2e2e2e');
+      CTX.fillStyle = '#cfcfcf'; CTX.font = `${3*SCALE}px monospace`; CTX.fillText('Bark at 12 birds!', (6+2)*SCALE, (H-11)*SCALE);
+    }
+
+    function drawAdults(){
+      clickables = [];
+      // carpet + room
+      rect(0,0,W,H,'#6e5e4a'); // floor wood tone
+      rect(6,6,W-12,H-12,'#7b6a55');
+      // bed
+      rect(20, 20, 60, 30, '#d9d1c7'); stroke(20,20,60,30,'#b9b0a5'); addClickable({x:20,y:20,w:60,h:30},'Big bed');
+      // two people (heads on pillows, on phones)
+      rect(26, 24, 6, 6, '#f2d2c4'); rect(28, 30, 3, 2, '#333'); // phone 1
+      rect(46, 24, 6, 6, '#f2d2c4'); rect(48, 30, 3, 2, '#333'); // phone 2
+      addClickable({x:26,y:24,w:6,h:6},'Grown‑up (scrolling on phone)');
+      addClickable({x:46,y:24,w:6,h:6},'Grown‑up (scrolling on phone)');
+      // drawers
+      rect(W-40, 18, 28, 12, '#9a886f'); stroke(W-40,18,28,12,'#7c6a54'); addClickable({x:W-40,y:18,w:28,h:12},'Drawers');
+      // suitcases / clothes around
+      adultsObjs.forEach((o,idx)=>{
+        const c = o.name.startsWith('Suitcase') ? '#3b3f58' : '#a27f5b';
+        rect(o.x, o.y, o.w, o.h, c); stroke(o.x,o.y,o.w,o.h,'#2a2a2a');
+        if(o.laid) drawSpeech(o.x, o.y-8, 'Zzz');
+        addClickable({x:o.x,y:o.y,w:o.w,h:o.h}, o.name);
+      });
+      // door to next
+      rect(W-22, H-36, 16, 28, progress.adult_naps>=8? '#2a2a2a' : '#000');
+      stroke(W-22, H-36, 16, 28, '#555');
+      addClickable({x:W-22,y:H-36,w:16,h:28},"Door to Girl's Room");
+      if(pointInBox(player.x,player.y,{x:W-22,y:H-8,w:16,h:8})){
+        drawSpeech(W-40, H-10, progress.adult_naps>=8? 'Press Enter to go →' : 'Lay down on 8 piles!');
+      }
+    }
+
+    function drawGirl(){
+      clickables = [];
+      // soft carpet & bunk bed
+      rect(0,0,W,H,'#5c5ea0');
+      // bunk bed frame
+      rect(16, 20, 50, 8, '#c9c9c9'); // lower bed
+      rect(16, 6, 50, 8, '#c9c9c9');  // upper bed
+      rect(14, 6, 4, 48, '#b3b3b3'); rect(64, 6, 4, 48, '#b3b3b3');
+      addClickable({x:16,y:6,w:50,h:8},'Upper bunk'); addClickable({x:16,y:20,w:50,h:8},'Lower bunk');
+      // girl with iPad on upper bunk
+      rect(34, 6, 6, 6, '#f2d2c4'); rect(40, 8, 6, 3, '#333'); addClickable({x:34,y:6,w:6,h:6},'Girl (focused on iPad)');
+      // plushie mountain
+      const P = girlObjs.plush; rect(P.x, P.y, P.w, P.h, '#d48db1'); stroke(P.x,P.y,P.w,P.h,'#a26a8a'); addClickable({x:P.x,y:P.y,w:P.w,h:P.h},'Plushie Mountain');
+      // bed table
+      rect(70, 8, 18, 10, '#9a886f'); stroke(70,8,18,10,'#7c6a54'); addClickable({x:70,y:8,w:18,h:10},'Bedside table');
+      // door to next
+      rect(W-22, H-36, 16, 28, progress.girl_bite_ms>=25000? '#2a2a2a' : '#000');
+      stroke(W-22, H-36, 16, 28, '#555');
+      addClickable({x:W-22,y:H-36,w:16,h:28},"Door to Boy's Room");
+      if(pointInBox(player.x,player.y,{x:W-22,y:H-8,w:16,h:8})){
+        drawSpeech(W-42, H-10, progress.girl_bite_ms>=25000? 'Press Enter to go →' : 'Chew plushies: 25s');
+      }
+    }
+
+    function drawBoy(){
+      clickables = [];
+      // room floor
+      rect(0,0,W,H,'#586b74');
+      // high bed (loft)
+      rect(8, 8, 70, 10, '#c1c1c1'); stroke(8,8,70,10,'#9a9a9a'); addClickable({x:8,y:8,w:70,h:10},'High bed');
+      // desk under bed
+      rect(10, 24, 66, 10, '#9a886f'); stroke(10,24,66,10,'#7c6a54'); addClickable({x:10,y:24,w:66,h:10},'Desk');
+      // clutter on desk
+      for(let i=0;i<6;i++){ rect(12+i*10, 22, 6, 2, '#bcbcbc'); }
+      addClickable({x:12,y:22,w:56,h:4},'Stuff on the desk');
+      // teenage boy on chair w/ laptop
+      rect(52, 26, 6, 6, '#f2d2c4'); // head
+      rect(56, 28, 6, 4, '#333'); // laptop
+      rect(48, 32, 10, 6, '#2a2a2a'); // chair seat
+      addClickable({x:52,y:26,w:6,h:6},'Teen (gaming on laptop)');
+      addClickable({x:56,y:28,w:6,h:4},'Laptop');
+      // mini puff (beanbag)
+      rect(W-30, H-20, 18, 10, '#8e4c6a'); stroke(W-30,H-20,18,10,'#5e2f44'); addClickable({x:W-30,y:H-20,w:18,h:10},'Mini puff');
+      // drawer
+      rect(W-40, 10, 28, 12, '#9a886f'); stroke(W-40,10,28,12,'#7c6a54'); addClickable({x:W-40,y:10,w:28,h:12},'Drawer');
+      // door to next
+      rect(W-22, H-36, 16, 28, progress.boy_pats>=11? '#2a2a2a' : '#000');
+      stroke(W-22, H-36, 16, 28, '#555');
+      addClickable({x:W-22,y:H-36,w:16,h:28},'Door to Living Room');
+      if(pointInBox(player.x,player.y,{x:W-22,y:H-8,w:16,h:8})){
+        drawSpeech(W-50, H-10, progress.boy_pats>=11? 'Press Enter to go →' : 'Get 11 pats! (B/S)');
+      }
+    }
+
+    function drawLiving(){
+      clickables = [];
+      // cozy floor
+      rect(0,0,W,H,'#5a4b3e');
+      // TV
+      rect(W*0.65, 10, 60, 35, '#111'); stroke(W*0.65,10,60,35,'#444'); addClickable({x:W*0.65,y:10,w:60,h:35},'TV');
+      // fake moving pixels on TV
+      const t = performance.now()/300;
+      for(let i=0;i<120;i++){
+        const rx = Math.floor((W*0.65+2 + (i*7)%56));
+        const ry = Math.floor(12 + (Math.sin(t+i)*0.5 + 0.5)*31);
+        rect(rx, ry, 1, 1, `hsl(${(i*23)%360} 60% 60%)`);
+      }
+      // window to garden with sunset + falling leaves
+      rect(8, 8, 90, 40, '#f2f2f2'); // frame
+      // sunset sky
+      for(let y=0;y<38;y++){
+        const hue = 25 + (y/38)*35; // orange to pink
+        rect(9, 9+y, 88, 1, `hsl(${hue} 70% ${60 - y*0.6}%)`);
+      }
+      // white wall and leaves
+      rect(60, 24, 30, 10, '#fff'); addClickable({x:8,y:8,w:90,h:40},'Window to the garden (sunset)');
+      for(let i=0;i<12;i++){
+        const lx = 12 + (i*7 % 80);
+        const ly = ( (performance.now()/80 + i*13) % 36 ) + 10;
+        rect(lx, ly, 1, 1, '#7aa15a');
+      }
+      // couch (everyone facing TV)
+      const couch = {x: 14, y: H-32, w: 60, h: 18};
+      rect(couch.x, couch.y, couch.w, couch.h, '#3a3a3a'); stroke(couch.x,couch.y,couch.w,couch.h,'#666'); addClickable(couch,'Couch (family)');
+      // people heads
+      for(let i=0;i<3;i++){ rect(couch.x+8+i*16, couch.y+2, 6, 6, '#f2d2c4'); }
+      // goal zone (next to everyone)
+      const zone = {x: couch.x + couch.w - 10, y: couch.y + couch.h - 8, w: 10, h: 8};
+      if(pointInBox(player.x, player.y, zone) && !progress.ending){
+        // trigger ending
+        progress.ending = true; transitioning = true; fade = 0; nextAfterFade = 'the_end';
+      }
+    }
+
+    // Bark logic
+    function doBark(){
+      if(player.barkCD>0) return;
+      player.barkCD = 400; // ms cooldown
+      // bark ring
+      const range = 18;
+      if(level==='garden'){
+        birds.forEach(b=>{
+          const dx = b.x - player.x, dy = b.y - player.y; const d = Math.hypot(dx,dy);
+          if(d<range && !b.barked){ b.barked=true; progress.garden_birds_barked++; showHint('Bird startled!'); }
+        });
+        // open doors if done
+        if(progress.garden_birds_barked>=12){ gardenDoors.forEach((d,i)=> d.open = (d.id!==4)); progress.doneGarden=true; }
+      }
+      if(level==='boy'){
+        // if near teen, get a pat
+        const near = Math.hypot(player.x-55, player.y-30) < 16;
+        if(near && progress.boy_pats<11){ progress.boy_pats++; showHint('Pat +1'); }
+      }
+    }
+
+    function doScratch(){
+      if(player.scratchCD>0) return;
+      player.scratchCD = 500; // ms
+      if(level==='boy'){
+        const near = Math.hypot(player.x-55, player.y-30) < 16;
+        if(near && progress.boy_pats<11){ progress.boy_pats++; showHint('Pat +1'); }
+      }
+    }
+
+    // Room-specific interactions
+    function tryEnterDoor(){
+      if(level==='garden'){
+        for(const d of gardenDoors){
+          const pad = {x:d.x, y:d.y+d.h, w:d.w, h:6};
+          if(pointInBox(player.x, player.y, pad)){
+            if(d.id===4){ showHint("Hm… this door doesn't open."); return; }
+            if(!d.open){ showHint('Bark at all 12 birds first!'); return; }
+            if(d.id===1) return goTo('adults');
+            if(d.id===2) return goTo('girl');
+            if(d.id===3) return goTo('boy');
+          }
+        }
+      }
+      if(level==='adults'){
+        const pad = {x:W-22, y:H-8, w:16, h:8};
+        if(pointInBox(player.x, player.y, pad)){
+          if(progress.adult_naps>=8) return goTo('girl');
+          else showHint('Lay down on 8 piles first.');
+        }
+      }
+      if(level==='girl'){
+        const pad = {x:W-22, y:H-8, w:16, h:8};
+        if(pointInBox(player.x, player.y, pad)){
+          if(progress.girl_bite_ms>=25000) return goTo('boy');
+          else showHint('Chew plushies long enough!');
+        }
+      }
+      if(level==='boy'){
+        const pad = {x:W-22, y:H-8, w:16, h:8};
+        if(pointInBox(player.x, player.y, pad)){
+          if(progress.boy_pats>=11) return goTo('living');
+          else showHint('More pats needed!');
+        }
+      }
+    }
+
+    let nextAfterFade = null;
+    function goTo(next){ transitioning = true; fade = 0; nextAfterFade = next; }
+
+    // Main update & draw
+    let last = performance.now();
+    function tick(){
+      const now = performance.now();
+      const dt = now - last; last = now;
+
+      // cooldowns
+      player.barkCD = Math.max(0, player.barkCD - dt);
+      player.scratchCD = Math.max(0, player.scratchCD - dt);
+
+      // input movement
+      const up = keys.has('w')||keys.has('W')||keys.has('ArrowUp');
+      const dn = keys.has('s')||keys.has('S')||keys.has('ArrowDown');
+      const lf = keys.has('a')||keys.has('A')||keys.has('ArrowLeft');
+      const rt = keys.has('d')||keys.has('D')||keys.has('ArrowRight');
+      const sp = keys.has(' ')||keys.has('b')||keys.has('B');
+      const sc = keys.has('s')||keys.has('S'); // scratch (also down key used for move)
+
+      const biteDown = keys.has('e')||keys.has('E');
+      const layDown = keys.has('l')||keys.has('L');
+
+      let dx = (rt?1:0) - (lf?1:0);
+      let dy = (dn?1:0) - (up?1:0);
+      if(dx||dy){
+        const len = Math.hypot(dx,dy)||1; dx/=len; dy/=len;
+        player.x += dx * player.speed * dt/16;
+        player.y += dy * player.speed * dt/16;
+        if(dx>0) player.facing = 1; else if(dx<0) player.facing = -1;
+      }
+      keepInBounds();
+
+      // actions
+      if(sp) { doBark(); }
+      if(keys.has('S')) { doScratch(); }
+
+      if(level==='adults'){
+        // laying on items
+        adultsObjs.forEach(o=>{
+          if(pointInBox(player.x, player.y, {x:o.x-2, y:o.y-2, w:o.w+4, h:o.h+4})){
+            if(layDown && !o.laid){ o._timer = (o._timer||0) + dt; if(o._timer>900){ o.laid = true; progress.adult_naps = adultsObjs.filter(a=>a.laid).length; showHint('Comfy!'); } }
+          } else { o._timer = 0; }
+        });
+      }
+
+      if(level==='girl'){
+        const P = girlObjs.plush;
+        if(pointInBox(player.x, player.y, {x:P.x-2, y:P.y-2, w:P.w+4, h:P.h+4})){
+          if(biteDown && progress.girl_bite_ms < 25000){ progress.girl_bite_ms += dt; if(Math.floor(progress.girl_bite_ms/1000)%3===0) hintText='Nom nom…'; }
+        }
+      }
+
+      // boy room pats also handled in bark/scratch
+
+      // Click to identify objects
+      if(mouse.just){
+        mouse.just = false;
+        for(const c of clickables){
+          if(pointInBox(mouse.x, mouse.y, c)){ showHint(c.label); break; }
+        }
+      }
+
+      // draw
+      CTX.clearRect(0,0,CANVAS.width,CANVAS.height);
+
+      // room render
+      if(level==='garden') drawGarden();
+      if(level==='adults') drawAdults();
+      if(level==='girl') drawGirl();
+      if(level==='boy') drawBoy();
+      if(level==='living') drawLiving();
+
+      // player sprite
+      if(level!=='the_end') drawWestie(player.x, player.y, player.facing, false);
+
+      // Bark indication
+      if(player.barkCD>260){
+        const r = 8 + (400-player.barkCD)/12; stroke(player.x-r, player.y-r, r*2, r*2, '#eeeeee');
+      }
+
+      // Tooltip hint
+      if(hintTimer>0){ hintTimer -= dt; drawSpeech(player.x-12, player.y-16, hintText); }
+
+      // Transition fade
+      if(transitioning){
+        fade = clamp(fade + dt/600, 0, 1);
+        CTX.fillStyle = `rgba(0,0,0,${fade})`; CTX.fillRect(0,0,CANVAS.width,CANVAS.height);
+        if(fade>=1){
+          transitioning = false; // switch level
+          if(nextAfterFade==='the_end'){
+            level = 'the_end';
+          } else {
+            level = nextAfterFade; setSpawnForLevel();
+          }
+          setHUD();
+          // fade back in
+          setTimeout(()=>{ transitioning = true; nextAfterFade=null; }, 50);
+        }
+      } else if(fade>0){
+        fade = clamp(fade - dt/600, 0, 1);
+        CTX.fillStyle = `rgba(0,0,0,${fade})`; CTX.fillRect(0,0,CANVAS.width,CANVAS.height);
+      }
+
+      // Ending screen
+      if(level==='the_end'){
+        // Fade from white to black, show THE END and the dog lying down
+        let a = clamp((performance.now()%2000)/2000, 0, 1);
+        CTX.fillStyle = '#000'; CTX.fillRect(0,0,CANVAS.width,CANVAS.height);
+        // THE END text
+        CTX.fillStyle = '#fff'; CTX.font = `${12*SCALE}px monospace`; CTX.textAlign='center'; CTX.textBaseline='middle';
+        CTX.fillText('THE END', CANVAS.width/2, CANVAS.height/2 - 40);
+        // dog lying down
+        drawWestie(W/2-6, H/2, 1, true);
+        CTX.textAlign='left';
+      }
+
+      setHUD();
+      requestAnimationFrame(tick);
+    }
+
+    function setSpawnForLevel(){
+      if(level==='garden'){ player.x=W*0.5; player.y=H*0.8; }
+      if(level==='adults'){ player.x=18; player.y=H-20; }
+      if(level==='girl'){ player.x=20; player.y=H-18; }
+      if(level==='boy'){ player.x=18; player.y=H-18; }
+      if(level==='living'){ player.x=12; player.y=H-18; }
+    }
+
+    // handle Enter interactions
+    window.addEventListener('keydown', e=>{ if(e.key==='Enter') tryEnterDoor(); });
+
+    // start loop
+    setHUD();
+    requestAnimationFrame(tick);
+  })();
+  </script>
+</body>
+</html>
